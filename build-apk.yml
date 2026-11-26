@@ -1,0 +1,130 @@
+# PEANUTS: builds the Peanuts Native APK on a GitHub-hosted Linux runner, so no Mac or local Android SDK is needed. Run it from the Actions tab
+# (build-apk > Run workflow), or push to the android11-support branch. The APK is attached to the run as the artifact "peanuts-native-apk".
+#
+# What it does, in the order the project documents (android/README.md "Build the APK", peanuts/docs/NEW-GAME.md step 6):
+#   1. installs the tools: JDK 21, the Android SDK platform and NDK 28.2 (the NDK build.gradle names), .NET 10 (the shader translator), zsh, Python 3.14
+#   2. peanuts/scripts/ondevice-stage.sh: the on-device packer's native side (CPython for Android, Capstone, lz4, the translator, SPIRV-Tools)
+#   3. ./gradlew apk -PnxApp=peanuts -PnxPackStage=<that stage>   -> android/app/out/nxnative-android-peanuts.apk
+#   4. check-min-api.py (nothing in the APK may need a newer Android than minSdk 30) and check-apk-holes.py, both reported in the job summary
+#
+# The APK is signed with the runner's debug key, which is new on every run: Android refuses to install a build over one signed with another key, so
+# uninstall the previous build first (its data goes with it). A release key for updates in place is a separate step (build.gradle -PnxRelease, NX_SIGN_*).
+name: build-apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: "Packer: native (the real on-device Prepare) or fake (screens only; its packs never start a game)"
+        type: choice
+        options: [native, fake]
+        default: native
+      app_id:
+        description: "Application id suffix (dev.nxnative.android.<suffix>); a different one installs beside another build"
+        default: peanuts
+      games:
+        description: "Title IDs to include, comma-separated (empty: every game gradle.properties lists)"
+        default: ''
+  push:
+    branches: [android11-support]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: 28.2.13676358   # android/app/build.gradle: ndkVersion
+  ENGINE: ${{ github.event.inputs.engine || 'native' }}
+  APP_ID: ${{ github.event.inputs.app_id || 'peanuts' }}
+  GAMES: ${{ github.event.inputs.games || '' }}
+
+defaults:
+  run:
+    shell: bash
+
+# The first three actions are pinned to the commit SHAs the other workflows use (the tag in the comment); setup-java, setup-dotnet and cache are named by
+# major tag. Dependabot (github-actions) can pin them.
+jobs:
+  apk:
+    name: Peanuts Native APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+
+      - uses: actions/setup-dotnet@v4
+        if: env.ENGINE == 'native'
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Android SDK platform and NDK
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null || true
+          "$sdkmanager" --install "platforms;android-36" "ndk;$NDK_VERSION" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          ls "$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt"
+
+      - name: Packages the packer's build needs (zsh, zlib for NativeAOT)
+        if: env.ENGINE == 'native'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh zlib1g-dev
+
+      - name: On-device packer stage (CPython, Capstone, translator, SPIRV-Tools)
+        if: env.ENGINE == 'native'
+        run: |
+          zsh peanuts/scripts/ondevice-stage.sh "$RUNNER_TEMP/packer" all
+          echo "NX_PACK_STAGE=$RUNNER_TEMP/packer/stage" >> "$GITHUB_ENV"
+          du -sh "$RUNNER_TEMP"/packer/stage/lib/* | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('android/app/build.gradle', 'android/app/gradle/wrapper/gradle-wrapper.properties', 'android/app/gradle.properties') }}
+          restore-keys: gradle-
+
+      - name: Build the APK
+        working-directory: android/app
+        run: |
+          args=(apk -PnxApp=peanuts "-PnxAppId=$APP_ID")
+          [ -n "$GAMES" ] && args+=("-PnxGames=$GAMES")
+          if [ "$ENGINE" = native ]; then args+=("-PnxPackStage=$NX_PACK_STAGE"); else args+=(-PnxPackEngine=fake); fi
+          ./gradlew "${args[@]}" --stacktrace
+          ls -l out/*.apk
+
+      - name: Nothing newer than Android 11 (API 30)
+        continue-on-error: true   # reported, not fatal: it lists what to guard next
+        run: |
+          {
+            echo '### check-min-api (minSdk 30)'
+            echo '```'
+            python3 peanuts/scripts/check-min-api.py android/app/out/*.apk 30 2>&1 | tail -40
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 peanuts/scripts/check-min-api.py android/app/out/*.apk 30 > /dev/null
+
+      - name: APK holes
+        continue-on-error: true
+        run: python3 peanuts/scripts/check-apk-holes.py android/app/out/*.apk 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: peanuts-native-apk
+          path: android/app/out/*.apk
+          retention-days: 30
+          if-no-files-found: error
